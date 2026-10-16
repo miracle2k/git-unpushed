@@ -1,0 +1,20 @@
+[package]
+name = "git-unpushed"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "A concise, parallel Git repository and worktree attention scanner"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.5"
+unicode-width = "0.2"
+tempfile = "3.23"
+
+[profile.release]
+lto = "thin"
+strip = true
