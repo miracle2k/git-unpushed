@@ -1,7 +1,8 @@
 # git-unpushed
 
-A concise Rust CLI for finding unfinished work and removable Git worktrees across
-many repositories.
+A CLI tool for finding unfinished work (dirty files, unpushed commits) across many
+repositories. It supports inspecting worktrees and identifying integrated ones that
+can be deleted.
 
 ```text
 ~/src/api:                 S
@@ -11,9 +12,7 @@ many repositories.
 ~/src/website:             M P
 ```
 
-Repositories are parent rows; their registered linked worktrees are indented below
-them, including worktrees outside the search roots. Quiet repositories are hidden
-by default. Ignored files alone do not make a checkout need attention.
+## Flag meaning
 
 | Flag | Meaning |
 | --- | --- |
