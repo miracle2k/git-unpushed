@@ -1,7 +1,7 @@
 # git-unpushed
 
 A concise Rust CLI for finding unfinished work and removable Git worktrees across
-many repositories. It replaces the original Python scanner in `main.py`.
+many repositories.
 
 ```text
 ~/src/api:                 S
@@ -52,10 +52,10 @@ installation. Set `CARGO_INSTALL_ROOT` to choose a different installation root;
 the executable goes into its `bin` subdirectory. `make` alone builds the release
 binary without installing it.
 
-With no roots, the current directory is scanned. As in the original script,
-discovery stops descending once it finds a repository; independently nested
-repositories and submodules are not separate scan roots unless explicitly
-supplied. Git's worktree registry discovers linked worktrees regardless of where
+With no roots, the current directory is scanned. Discovery stops descending once
+it finds a repository; independently nested repositories and submodules are not
+separate scan roots unless explicitly supplied. Git's worktree registry discovers
+linked worktrees regardless of where
 they are stored. Repeated and overlapping roots are deduplicated by the canonical
 shared Git directory. Bare repositories can be scanned and can own linked
 worktrees.

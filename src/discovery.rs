@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Stop at checkouts just as the original script did. Registered worktrees are
+/// Stop descending at checkouts. Registered worktrees are
 /// enumerated from Git, so they need not be under any of the search roots.
 pub fn discover(roots: &[PathBuf]) -> (Vec<RepositorySeed>, Vec<String>) {
     discover_with_progress(roots, |_, _, _| {})
