@@ -304,12 +304,13 @@ fn execute(cli: Cli) -> Result<bool> {
     io::stdout().lock().write_all(output.as_bytes())?;
     if cli.timings {
         eprintln!(
-            "discovery {:.3}s · scan {:.3}s · total {:.3}s · {} repositories · {} workers",
+            "discovery {:.3}s · scan {:.3}s · total {:.3}s · {} repositories · {} workers · {} Git commands",
             discovery_elapsed.as_secs_f64(),
             scan_elapsed.as_secs_f64(),
             started.elapsed().as_secs_f64(),
             report.repositories.len(),
-            jobs
+            jobs,
+            git::invocation_count()
         );
     }
     Ok(has_errors)

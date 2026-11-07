@@ -5,12 +5,20 @@ use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NATIVE_COMMANDS: AtomicU64 = AtomicU64::new(0);
+
+pub fn invocation_count() -> u64 {
+    NATIVE_COMMANDS.load(Ordering::Relaxed)
+}
 
 pub(crate) fn command(path: &Path, args: &[&str]) -> Command {
     command_with_optional_locks(path, args, false)
 }
 
 fn command_with_optional_locks(path: &Path, args: &[&str], optional_locks: bool) -> Command {
+    NATIVE_COMMANDS.fetch_add(1, Ordering::Relaxed);
     let mut command = Command::new("git");
     if !optional_locks {
         command.arg("--no-optional-locks");
@@ -79,27 +87,16 @@ pub(crate) fn run_status(path: &Path, args: &[&str], refresh_index: bool) -> Res
 /// objects, namespaces, or alternate object stores from the process environment.
 /// Native Git remains the fallback for unsupported formats and index extensions.
 pub(crate) fn open_metadata(path: &Path) -> Result<gix::Repository> {
-    gix::open_opts(
-        path,
-        gix::open::Options::isolated()
-            .strict_config(true)
-            .lossy_config(true)
-            .config_overrides(["core.useReplaceRefs=false"]),
-    )
-    .map_err(|_| anyhow::anyhow!("could not open repository metadata"))
+    crate::metadata::open(path)
 }
 
 pub(crate) fn has_hidden_index_entries(path: &Path) -> Result<bool> {
     let cached = (|| -> Result<bool> {
         let repository = open_metadata(path)?;
-        let index = repository
-            .index()
-            .map_err(|_| anyhow::anyhow!("cannot read index"))?;
-        // Split indexes require their shared index; sparse directory entries
-        // require expansion to reproduce `ls-files -v`. Let Git handle both.
-        if index.link().is_some() || index.is_sparse() {
-            anyhow::bail!("index requires native Git");
-        }
+        let index = repository.index()?;
+        // Gix resolves split indexes when reading the file. Sparse directory
+        // entries carry SKIP_WORKTREE, which is enough to reject deletion
+        // without expanding the directory into individual files.
         let hidden =
             gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE;
         Ok(index
@@ -107,7 +104,7 @@ pub(crate) fn has_hidden_index_entries(path: &Path) -> Result<bool> {
             .iter()
             .any(|entry| entry.flags.intersects(hidden)))
     })();
-    cached.or_else(|_| {
+    crate::metadata::or_native(cached, || {
         let output = run(path, &["ls-files", "-v", "-z"])?;
         Ok(output.split(|byte| *byte == 0).any(|field| {
             field
@@ -118,7 +115,7 @@ pub(crate) fn has_hidden_index_entries(path: &Path) -> Result<bool> {
 }
 
 /// The status inspection already resolved the private Git directory and read
-/// HEAD with native Git. Reuse those facts instead of reopening the repository.
+/// HEAD. Reuse those facts instead of reopening the repository.
 pub(crate) fn has_hidden_index_entries_at(
     path: &Path,
     git_dir: &Path,
@@ -130,11 +127,7 @@ pub(crate) fn has_hidden_index_entries_at(
         _ => return has_hidden_index_entries(path),
     };
     let cached = (|| -> Result<bool> {
-        let index = gix::index::File::at(git_dir.join("index"), kind, false, Default::default())
-            .map_err(|_| anyhow::anyhow!("cannot read index"))?;
-        if index.link().is_some() || index.is_sparse() {
-            anyhow::bail!("index requires native Git");
-        }
+        let index = gix::index::File::at(git_dir.join("index"), kind, false, Default::default())?;
         let hidden =
             gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE;
         Ok(index
@@ -142,7 +135,7 @@ pub(crate) fn has_hidden_index_entries_at(
             .iter()
             .any(|entry| entry.flags.intersects(hidden)))
     })();
-    cached.or_else(|_| {
+    crate::metadata::or_native(cached, || {
         let output = run(path, &["ls-files", "-v", "-z"])?;
         Ok(output.split(|byte| *byte == 0).any(|field| {
             field
@@ -186,6 +179,22 @@ pub(crate) fn run_with_input(path: &Path, args: &[&str], input: &[u8]) -> Result
 pub fn resolve_seed(path: &Path) -> Result<RepositorySeed> {
     if let Some(seed) = seed_from_metadata(path) {
         return Ok(seed);
+    }
+    match crate::metadata::open(path) {
+        Ok(repo) => {
+            return Ok(RepositorySeed {
+                path: repo
+                    .workdir()
+                    .unwrap_or_else(|| repo.common_dir())
+                    .to_path_buf(),
+                common_dir: repo
+                    .common_dir()
+                    .canonicalize()
+                    .context("cannot resolve common Git directory")?,
+            });
+        }
+        Err(error) if crate::metadata::may_use_native(&error) => (),
+        Err(_) => bail!("cannot resolve repository metadata"),
     }
     let common = run(
         path,

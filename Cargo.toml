@@ -14,7 +14,7 @@ serde_json = "1.0"
 walkdir = "2.5"
 unicode-width = "0.2"
 tempfile = "3.23"
-gix = { version = "0.90", default-features = false, features = ["sha1", "sha256", "index", "revision"] }
+gix = { version = "0.90", default-features = false, features = ["sha1", "sha256", "index", "revision", "status", "parallel", "blocking-http-transport-curl"] }
 
 [profile.release]
 lto = "thin"

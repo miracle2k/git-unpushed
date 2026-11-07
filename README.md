@@ -17,7 +17,11 @@ Only items needing attention are shown by default.
 
 ## Install
 
-Requires Git and Rust 1.91 or newer.
+Building requires Rust 1.91 or newer. Normal scans and remote refreshes use Gix
+inside the process; run `git-unpushed` directly when Git is not installed.
+Git is still needed for `--deep`, worktree deletion, and compatibility fallbacks
+such as reftable repositories. Configured filters, credential helpers, and SSH
+transports can also require external programs.
 
 ```sh
 make install
@@ -109,7 +113,8 @@ to hide the indicator. Piped output is buffered and sorted by default.
 (including dirty work), `1` for operational errors, and `2` for invalid arguments.
 
 See `git-unpushed --help` for all options, including parallelism (`--jobs`),
-timings (`--timings`), and color controls.
+timings (`--timings`), and color controls. Timings include the number of native
+Git commands attempted, so compatibility fallbacks are visible.
 
 ## Development
 

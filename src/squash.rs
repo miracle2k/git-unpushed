@@ -71,7 +71,11 @@ pub(crate) fn detect(
     // same head/base delta whenever several tips share it.
     let mut deltas: Vec<Delta> = Vec::new();
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
-    let repository = git::open_metadata(path).ok();
+    let repository = match git::open_metadata(path) {
+        Ok(repository) => Some(repository),
+        Err(error) if crate::metadata::may_use_native(&error) => None,
+        Err(error) => return Err(error),
+    };
     let cache = repository
         .as_ref()
         .and_then(|repo| repo.commit_graph_if_enabled().ok().flatten());
@@ -79,17 +83,20 @@ pub(crate) fn detect(
         .as_ref()
         .map(|repo| repo.revision_graph(cache.as_ref()));
     let mut merge_bases = |tip: &str, head: &str| -> Result<Vec<String>> {
-        let cached = (|| {
-            let repo = repository.as_ref()?;
-            let graph = graph.as_mut()?;
-            let tip = gix::hash::ObjectId::from_hex(tip.as_bytes()).ok()?;
-            let head = gix::hash::ObjectId::from_hex(head.as_bytes()).ok()?;
-            repo.merge_bases_many_with_graph(tip, &[head], graph)
-                .ok()
+        if let (Some(repo), Some(graph)) = (repository.as_ref(), graph.as_mut()) {
+            let result = repo
+                .merge_bases_many_with_graph(
+                    gix::hash::ObjectId::from_hex(tip.as_bytes())?,
+                    &[gix::hash::ObjectId::from_hex(head.as_bytes())?],
+                    graph,
+                )
                 .map(|bases| bases.into_iter().map(|id| id.to_string()).collect())
-        })();
-        if let Some(bases) = cached {
-            return Ok(bases);
+                .map_err(Into::into);
+            match result {
+                Ok(bases) => return Ok(bases),
+                Err(error) if !crate::metadata::may_use_native(&error) => return Err(error),
+                Err(_) => (),
+            }
         }
         match git::run_optional(path, &["merge-base", "--all", tip, head])? {
             Some(raw) => parse_oids(&raw),
@@ -126,7 +133,11 @@ pub(crate) fn detect(
         let mut args = vec!["diff-tree", "-r", "--raw", "-z", "--no-abbrev"];
         args.extend_from_slice(DIFF_FLAGS);
         args.extend([delta.base.as_str(), delta.head.as_str(), "--"]);
-        let signature = raw_signature(&git::run(path, &args)?)?;
+        let raw = crate::metadata::or_native(
+            crate::metadata::raw_diff(path, &delta.base, &delta.head),
+            || git::run(path, &args),
+        )?;
+        let signature = raw_signature(&raw)?;
         if signature.is_empty() {
             // Empty net changes do not by themselves establish integration.
             continue;
@@ -284,6 +295,57 @@ fn series_matches(
 }
 
 fn history(path: &Path, heads: &[&str], excluded_tip: Option<&str>) -> Result<Vec<HistoryCommit>> {
+    crate::metadata::or_native(history_from_gix(path, heads, excluded_tip), || {
+        history_from_git(path, heads, excluded_tip)
+    })
+}
+
+fn history_from_gix(
+    path: &Path,
+    heads: &[&str],
+    excluded_tip: Option<&str>,
+) -> Result<Vec<HistoryCommit>> {
+    let mut repo = crate::metadata::open(path)?;
+    repo.object_cache_size_if_unset(8 * 1024 * 1024);
+    let heads = heads
+        .iter()
+        .map(|head| gix::hash::ObjectId::from_hex(head.as_bytes()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut walk = repo.rev_walk(heads);
+    if let Some(tip) = excluded_tip {
+        walk = walk.with_hidden([gix::hash::ObjectId::from_hex(tip.as_bytes())?]);
+    }
+    let mut commits = Vec::new();
+    for info in walk.all()? {
+        let info = info?;
+        let parents: Vec<_> = info.parent_ids.iter().map(ToString::to_string).collect();
+        if excluded_tip.is_none() && parents.len() > 1 {
+            continue;
+        }
+        let signature = if parents.len() > 1 {
+            Vec::new()
+        } else {
+            let commit = repo.find_commit(info.id)?;
+            let old = match info.parent_ids.first() {
+                Some(parent) => repo.find_commit(*parent)?.tree()?,
+                None => repo.empty_tree(),
+            };
+            raw_signature(&crate::metadata::tree_diff(&repo, &old, &commit.tree()?)?)?
+        };
+        commits.push(HistoryCommit {
+            oid: info.id.to_string(),
+            parents,
+            signature,
+        });
+    }
+    Ok(commits)
+}
+
+fn history_from_git(
+    path: &Path,
+    heads: &[&str],
+    excluded_tip: Option<&str>,
+) -> Result<Vec<HistoryCommit>> {
     let mut args = vec![
         "log",
         "--no-notes",

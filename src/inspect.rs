@@ -1,4 +1,5 @@
 use crate::git::{self, bytes_path, trim_newline};
+use crate::metadata;
 use crate::model::*;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -7,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Mapping {
+pub(crate) struct Mapping {
     source: String,
     destination: String,
 }
@@ -37,7 +38,7 @@ impl Mapping {
         })
     }
 
-    fn source_for(&self, reference: &str) -> Option<String> {
+    pub(crate) fn source_for(&self, reference: &str) -> Option<String> {
         if let Some((prefix, suffix)) = self.destination.split_once('*') {
             let middle = reference.strip_prefix(prefix)?.strip_suffix(suffix)?;
             Some(self.source.replacen('*', middle, 1))
@@ -177,8 +178,12 @@ fn inspect(
     only: Option<&Path>,
     completed: Option<&(dyn Fn(&Path) + Sync)>,
 ) -> Result<RepositoryReport> {
-    let entries = git::run(&seed.path, &["worktree", "list", "--porcelain", "-z"])?;
-    let mut worktrees = parse_worktrees(&entries)?;
+    let mut worktrees = metadata::or_native(metadata::worktrees(&seed.path), || {
+        parse_worktrees(&git::run(
+            &seed.path,
+            &["worktree", "list", "--porcelain", "-z"],
+        )?)
+    })?;
     let primary_path = worktrees
         .first()
         .map(|entry| entry.path.clone())
@@ -196,18 +201,7 @@ fn inspect(
             if !remote.report.eligible {
                 continue;
             }
-            match git::run(
-                &seed.path,
-                &[
-                    "fetch",
-                    "--prune",
-                    "--no-tags",
-                    "--no-prune-tags",
-                    "--no-recurse-submodules",
-                    "--",
-                    &remote.report.name,
-                ],
-            ) {
+            match crate::fetch::run(&seed.path, &remote.report.name, &remote.mappings) {
                 Ok(_) => remote.refreshed = true,
                 Err(_) => {
                     remote.report.issue = Some("refresh failed".into());
@@ -463,29 +457,47 @@ fn inspect_status(
             .push("worktree is inaccessible or prunable".into());
         return;
     }
-    match git::run_status(
-        &entry.path,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--untracked-files=normal",
-            "--ignored=matching",
-            "--ignore-submodules=none",
-            "--no-renames",
-            "--no-ahead-behind",
-        ],
-        refresh_index,
-    ) {
-        Ok(output) => {
-            if let Err(error) = parse_status(&output, entry) {
-                entry.errors.push(error.to_string());
+    let in_process = metadata::status(&entry.path, refresh_index);
+    let use_native = in_process
+        .as_ref()
+        .err()
+        .is_some_and(metadata::may_use_native);
+    if let Ok(status) = in_process {
+        entry.modified = status.modified;
+        entry.untracked = status.untracked;
+        entry.ignored = status.ignored;
+        entry.conflicts = status.conflicts;
+        entry.head = status.head;
+        entry.branch = status.branch;
+    } else if use_native {
+        match git::run_status(
+            &entry.path,
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=normal",
+                "--ignored=matching",
+                "--ignore-submodules=none",
+                "--no-renames",
+                "--no-ahead-behind",
+            ],
+            refresh_index,
+        ) {
+            Ok(output) => {
+                if let Err(error) = parse_status(&output, entry) {
+                    entry.errors.push(error.to_string());
+                }
             }
+            Err(_) => entry
+                .errors
+                .push("could not inspect working-copy status".into()),
         }
-        Err(_) => entry
+    } else {
+        entry
             .errors
-            .push("could not inspect working-copy status".into()),
+            .push("could not inspect working-copy status".into());
     }
     let git_dir = match worktree_git_dir(&entry.path) {
         Ok(path) => path,
@@ -568,19 +580,22 @@ fn worktree_git_dir(path: &Path) -> Result<PathBuf> {
 }
 
 fn initialized_submodules(path: &Path) -> Result<bool> {
-    let output = git::run_optional(
-        path,
-        &[
-            "config",
-            "--no-includes",
-            "--null",
-            "--file",
-            ".gitmodules",
-            "--get-regexp",
-            "^submodule\\..*\\.path$",
-        ],
-    )?;
-    for field in output.unwrap_or_default().split(|byte| *byte == 0) {
+    let output = metadata::or_native(metadata::submodule_config(path), || {
+        git::run_optional(
+            path,
+            &[
+                "config",
+                "--no-includes",
+                "--null",
+                "--file",
+                ".gitmodules",
+                "--get-regexp",
+                "^submodule\\..*\\.path$",
+            ],
+        )
+        .map(Option::unwrap_or_default)
+    })?;
+    for field in output.split(|byte| *byte == 0) {
         if let Some(index) = field.iter().position(|byte| *byte == b'\n')
             && path
                 .join(bytes_path(&field[index + 1..]))
@@ -671,20 +686,15 @@ fn assess_removal(entry: &mut WorktreeReport, options: &ScanOptions) {
 }
 
 fn load_references(path: &Path) -> Result<HashMap<String, Reference>> {
-    references_from_metadata(path).or_else(|_| references_from_git(path))
+    metadata::or_native(references_from_metadata(path), || references_from_git(path))
 }
 
 fn references_from_metadata(path: &Path) -> Result<HashMap<String, Reference>> {
     let repository = git::open_metadata(path)?;
-    let platform = repository
-        .references()
-        .map_err(|_| anyhow::anyhow!("cannot list references"))?;
+    let platform = repository.references()?;
     let mut raw = HashMap::new();
-    for reference in platform
-        .all()
-        .map_err(|_| anyhow::anyhow!("cannot list references"))?
-    {
-        let reference = reference.map_err(|_| anyhow::anyhow!("cannot read reference"))?;
+    for reference in platform.all()? {
+        let reference = reference?;
         let name = std::str::from_utf8(reference.name().as_bstr())?.to_owned();
         let (oid, symbolic) = match reference.target() {
             gix::refs::TargetRef::Object(oid) => (oid.to_string(), None),
@@ -696,16 +706,20 @@ fn references_from_metadata(path: &Path) -> Result<HashMap<String, Reference>> {
         raw.insert(name, Reference { oid, symbolic });
     }
     let mut result = HashMap::with_capacity(raw.len());
-    for (name, reference) in &raw {
+    'references: for (name, reference) in &raw {
         let mut current_name = name;
         let mut current = reference;
         let mut visited = HashSet::new();
         while let Some(target) = &current.symbolic {
             if !visited.insert(current_name) {
-                bail!("symbolic reference cycle");
+                continue 'references;
             }
             current_name = target;
-            current = raw.get(target).context("unresolved symbolic reference")?;
+            let Some(next) = raw.get(target) else {
+                // Like for-each-ref, omit dangling symbolic references.
+                continue 'references;
+            };
+            current = next;
         }
         result.insert(
             name.clone(),
@@ -753,15 +767,18 @@ fn load_remotes(
     options: &ScanOptions,
     errors: &mut Vec<String>,
 ) -> Result<Vec<Remote>> {
-    let config = git::run_optional(
-        path,
-        &[
-            "config",
-            "--null",
-            "--get-regexp",
-            "^(remote\\..*\\.(url|fetch|vcs)|url\\..*\\.insteadof)$",
-        ],
-    )?;
+    let config = metadata::or_native(metadata::remote_config(path), || {
+        git::run_optional(
+            path,
+            &[
+                "config",
+                "--null",
+                "--get-regexp",
+                "^(remote\\..*\\.(url|fetch|vcs)|url\\..*\\.insteadof)$",
+            ],
+        )
+        .map(Option::unwrap_or_default)
+    })?;
     #[derive(Default)]
     struct Configuration {
         specifications: Vec<String>,
@@ -770,7 +787,7 @@ fn load_remotes(
     }
     let mut configurations: HashMap<String, Configuration> = HashMap::new();
     let mut rewrites = Vec::new();
-    for field in config.unwrap_or_default().split(|byte| *byte == 0) {
+    for field in config.split(|byte| *byte == 0) {
         let Some(index) = field.iter().position(|byte| *byte == b'\n') else {
             continue;
         };
@@ -1013,6 +1030,27 @@ fn resolve_base(
     base: &str,
     references: &HashMap<String, Reference>,
 ) -> Option<String> {
+    let resolved = (|| -> Result<String> {
+        let repo = metadata::open(path)?;
+        let spec = repo.rev_parse(base)?;
+        if spec.single().is_none() {
+            bail!("base is a range");
+        }
+        let reference = spec.first_reference().context("base is not a reference")?;
+        let name = std::str::from_utf8(reference.name.as_bstr())?.to_owned();
+        if references
+            .get(&name)
+            .is_none_or(|reference| reference.symbolic.is_some())
+        {
+            bail!("base is not a direct reference");
+        }
+        Ok(name)
+    })();
+    match resolved {
+        Ok(name) => return Some(name),
+        Err(error) if !metadata::may_use_native(&error) => return None,
+        Err(_) => (),
+    }
     let output = git::run(
         path,
         &[
@@ -1056,24 +1094,29 @@ fn reachable(
             .map(|head| (head.clone(), tips.contains(head).then_some(true)))
             .collect();
     }
-    let mut input = Vec::new();
-    for head in heads {
-        input.extend_from_slice(head.as_bytes());
-        input.push(b'\n');
-    }
-    for tip in tips {
-        input.push(b'^');
-        input.extend_from_slice(tip.as_bytes());
-        input.push(b'\n');
-    }
-    match git::run_with_input(path, &["rev-list", "--stdin"], &input) {
-        Ok(output) => {
-            let unique: HashSet<&[u8]> = output.split(|byte| *byte == b'\n').collect();
-            heads
-                .iter()
-                .map(|head| (head.clone(), Some(!unique.contains(head.as_bytes()))))
-                .collect()
+    let result = metadata::or_native(metadata::reachable(path, heads, tips), || {
+        let mut input = Vec::new();
+        for head in heads {
+            input.extend_from_slice(head.as_bytes());
+            input.push(b'\n');
         }
+        for tip in tips {
+            input.push(b'^');
+            input.extend_from_slice(tip.as_bytes());
+            input.push(b'\n');
+        }
+        let output = git::run_with_input(path, &["rev-list", "--stdin"], &input)?;
+        let unique: HashSet<&[u8]> = output.split(|byte| *byte == b'\n').collect();
+        Ok(heads
+            .iter()
+            .map(|head| (head.clone(), !unique.contains(head.as_bytes())))
+            .collect())
+    });
+    match result {
+        Ok(reachable) => reachable
+            .into_iter()
+            .map(|(head, reachable)| (head, Some(reachable)))
+            .collect(),
         Err(_) => {
             if !errors
                 .iter()
