@@ -78,6 +78,77 @@ pub enum DeletionStatus {
 pub struct DeletionResult {
     pub status: DeletionStatus,
     pub reason: Option<String>,
+    pub stats: Option<DeletionStats>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DeletionStats {
+    /// Successfully removed non-directory entries, including symbolic links.
+    pub files: u64,
+    /// Logical file lengths, or None when size collection is disabled.
+    pub bytes: Option<u64>,
+}
+
+impl DeletionStats {
+    pub fn new(collect_size: bool) -> Self {
+        Self {
+            files: 0,
+            bytes: collect_size.then_some(0),
+        }
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.files += other.files;
+        if let (Some(total), Some(bytes)) = (&mut self.bytes, other.bytes) {
+            *total += bytes;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletionSummary {
+    pub dry_run: bool,
+    pub worktrees: u64,
+    pub files: u64,
+    pub bytes: Option<u64>,
+    pub failed: u64,
+    pub skipped: u64,
+}
+
+impl DeletionSummary {
+    pub fn from_repositories(
+        repositories: &[RepositoryReport],
+        dry_run: bool,
+        collect_size: bool,
+    ) -> Self {
+        let mut stats = DeletionStats::new(collect_size);
+        let mut summary = Self {
+            dry_run,
+            worktrees: 0,
+            files: 0,
+            bytes: stats.bytes,
+            failed: 0,
+            skipped: 0,
+        };
+        for result in repositories
+            .iter()
+            .flat_map(|repo| &repo.worktrees)
+            .filter_map(|tree| tree.deletion.as_ref())
+        {
+            match result.status {
+                DeletionStatus::Deleted | DeletionStatus::WouldDelete => summary.worktrees += 1,
+                DeletionStatus::Failed => summary.failed += 1,
+                DeletionStatus::Skipped => summary.skipped += 1,
+            }
+            // Failed removals can still have successfully deleted some files.
+            if let Some(removed) = result.stats {
+                stats.add(removed);
+            }
+        }
+        summary.files = stats.files;
+        summary.bytes = stats.bytes;
+        summary
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +156,8 @@ pub struct ScanReport {
     pub repositories: Vec<RepositoryReport>,
     pub errors: Vec<String>,
     pub elapsed_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletion_summary: Option<DeletionSummary>,
 }
 
 impl WorktreeReport {

@@ -17,7 +17,11 @@ Only items needing attention are shown by default.
 
 ## Install
 
-Requires Git and Rust 1.91 or newer.
+Building requires Rust 1.91 or newer. Normal scans and remote refreshes use Gix
+inside the process; run `git-unpushed` directly when Git is not installed.
+Git is still needed for `--deep` and compatibility fallbacks
+such as reftable repositories. Configured filters, credential helpers, and SSH
+transports can also require external programs.
 
 ```sh
 make install
@@ -80,6 +84,7 @@ Unconfirmed work stays `U`; that does not necessarily mean it was never merged.
 ```sh
 git unpushed --delete --dry-run ~/src  # Preview
 git unpushed --delete ~/src           # Remove eligible worktrees
+git unpushed --delete --no-delete-size ~/src  # Count files without collecting sizes
 ```
 
 Deletion removes checkout directories and their worktree registrations, retaining
@@ -91,6 +96,20 @@ By default, worktrees must be clean and provably integrated into a qualifying
 remote mainline. Dirty, locked, uncertain, or otherwise protected worktrees are
 skipped, as are primary checkouts and the worktree containing the current working
 directory. Eligibility is checked again immediately before removal.
+
+Deletion ends with a total such as `Deleted 3 worktrees · 42817 files · 1.8 GiB`.
+Totals include checkout files, ignored files, symbolic links, and the removed
+worktree registrations. Branches and shared repository objects are retained.
+File counts come from successful removals; partial failures contribute only the
+files already removed. `--json` includes per-worktree `deletion.stats` and a
+report-wide `deletion_summary`.
+
+Byte totals are logical file lengths measured before removal, including link
+lengths, and can differ from disk space recovered with sparse files, hard links,
+compression, or snapshots. `--no-delete-size` skips file-size collection and
+reports only file and worktree counts (`bytes: null` in JSON). Dry runs show
+estimated totals without deleting files. Measurement and removal do not follow
+symbolic links. On Unix, traversal stays on the containing filesystem.
 
 | Option | Effect |
 | --- | --- |
@@ -109,7 +128,8 @@ to hide the indicator. Piped output is buffered and sorted by default.
 (including dirty work), `1` for operational errors, and `2` for invalid arguments.
 
 See `git-unpushed --help` for all options, including parallelism (`--jobs`),
-timings (`--timings`), and color controls.
+timings (`--timings`), and color controls. Timings include the number of native
+Git commands attempted, so compatibility fallbacks are visible.
 
 ## Development
 
@@ -117,3 +137,25 @@ timings (`--timings`), and color controls.
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+To compare two release builds on stable repositories without refreshing their
+indexes or fetching remotes:
+
+```sh
+cargo run --release --example benchmark_scan -- /path/to/baseline /path/to/candidate /path/to/repos
+```
+
+The helper alternates the binaries, checks that their JSON reports and exit codes
+match (excluding elapsed time), and reports median scan times and binary sizes.
+Use `--runs 5` for more samples. Close other tools that modify the scanned
+repositories during the comparison.
+
+To compare native Git removal, removal with file counts, and removal with file
+and byte counts on disposable worktrees:
+
+```sh
+cargo run --release --example benchmark_removal -- --files 10000 --runs 5
+```
+
+This creates its own temporary repository, rotates the three modes, and excludes
+fixture creation from the timings. It does not remove any existing worktrees.

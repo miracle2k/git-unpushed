@@ -51,6 +51,45 @@ fn cli(root: &Path, args: &[&str]) -> Output {
     command.output().expect("execute git-unpushed")
 }
 
+#[cfg(unix)]
+fn cli_without_git(fixture: &Fixture, args: &[&str]) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = fixture._temp.path().join("no-git-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("git");
+    fs::write(
+        &executable,
+        "#!/bin/sh\n: > \"$TEST_GIT_CALLED\"\nexit 127\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = bin.join("git-was-called");
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_git-unpushed"));
+    isolate_git(&mut command);
+    let output = command
+        .current_dir(&fixture.scan)
+        .args(args)
+        .args(["--json", "--timings", "--progress=never"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("TEST_GIT_CALLED", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        !marker.exists(),
+        "scan attempted to execute Git: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("0 Git commands"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 fn json(root: &Path, args: &[&str]) -> Value {
     let mut json_args = args.to_vec();
     json_args.push("--json");
@@ -219,6 +258,198 @@ fn reports_multiple_repositories_and_external_worktrees_once() {
             .len(),
         3
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_scans_and_exact_history_detection_need_no_git_executable() {
+    let fixture = Fixture::new();
+    let squashed = fixture.tree("squashed");
+    fixture.commit(&squashed, "First feature step\n");
+    fixture.commit(&squashed, "Completed feature\n");
+    git(&fixture.repo, &["merge", "--squash", "squashed"]);
+    git(&fixture.repo, &["commit", "-m", "Squash feature"]);
+    let copied = fixture.tree("copied");
+    let mut commits = Vec::new();
+    for content in ["First copied step\n", "Completed copied work\n"] {
+        fixture.commit(&copied, content);
+        commits.push(git(&copied, &["rev-parse", "HEAD"]).trim().to_owned());
+    }
+    fs::write(fixture.repo.join("unrelated.txt"), "Advance main\n").unwrap();
+    git(&fixture.repo, &["add", "unrelated.txt"]);
+    git(
+        &fixture.repo,
+        &["commit", "-m", "Independent mainline work"],
+    );
+    for commit in commits {
+        git(&fixture.repo, &["cherry-pick", &commit]);
+    }
+    git(
+        &fixture.repo,
+        &["push", "origin", "main", "squashed", "copied"],
+    );
+    let zed = fixture.tree("Zed");
+    git(&fixture.repo, &["config", "core.ignoreCase", "true"]);
+    git(&fixture.repo, &["pack-refs", "--all"]);
+    fixture.nonlocal_remote();
+    fs::create_dir_all(squashed.join("ignored/empty")).unwrap();
+    fs::create_dir_all(squashed.join("untracked/empty/nested")).unwrap();
+    // Both the index-refresh path and read-only path must work without Git.
+    for args in [vec![], vec!["--no-index-refresh", "--base", "origin/main"]] {
+        let output = cli_without_git(&fixture, &args);
+        assert!(output.status.success(), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let repo = only_repository(&report);
+        let paths: Vec<_> = repo["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|tree| Path::new(tree["path"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![copied.as_path(), squashed.as_path(), zed.as_path()]
+        );
+        for path in [&squashed, &copied] {
+            let tree = worktree(repo, path);
+            assert_eq!(tree["integrated"], true, "{tree:#}");
+            assert_eq!(tree["backed_up"], true, "{tree:#}");
+            assert_eq!(tree["removable"], true, "{tree:#}");
+            assert_eq!(tree["untracked"], false, "empty directories are not files");
+        }
+        assert_eq!(worktree(repo, &squashed)["ignored"], true);
+    }
+    let broken = fixture.scan.join("broken");
+    fs::create_dir(&broken).unwrap();
+    fs::write(broken.join(".git"), "gitdir: missing-registration\n").unwrap();
+    let output = cli_without_git(&fixture, &["--no-index-refresh"]);
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+    assert!(
+        report["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("cannot resolve repository metadata")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fetch_updates_and_prunes_only_remote_branches_without_a_git_client() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let done = fixture.tree("done");
+    let old = git(&fixture.repo, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&fixture.repo, &["branch", "stale"]);
+    git(&fixture.repo, &["tag", "preserved"]);
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/origin/stale", &old],
+    );
+    // A different producer adds objects this client does not yet have. Replacing
+    // stale with stale/child also requires pruning before ref updates.
+    let producer = fixture._temp.path().join("producer");
+    git(
+        fixture._temp.path(),
+        &[
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            producer.to_str().unwrap(),
+        ],
+    );
+    git(&producer, &["config", "user.name", "Fetch test"]);
+    git(
+        &producer,
+        &["config", "user.email", "fetch@example.invalid"],
+    );
+    fixture.commit(&producer, "New remote content\n");
+    let new = git(&producer, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&producer, &["push", "origin", "main"]);
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/stale/child", &new],
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/tags/preserved", &new],
+    );
+    git(&fixture.repo, &["config", "remote.origin.tagOpt", "--tags"]);
+    git(&fixture.repo, &["config", "fetch.pruneTags", "true"]);
+    git(
+        &fixture.repo,
+        &["config", "remote.origin.pruneTags", "true"],
+    );
+
+    // The SSH fixture is a local server process. The scanner must implement the
+    // client itself; invoking a Git client through PATH fails this test.
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap();
+    let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    let server = fixture._temp.path().join("fixture-ssh");
+    fs::write(
+        &server,
+        format!(
+            "#!/bin/sh\nexec {} upload-pack {}\n",
+            quote(&real_git),
+            quote(&fixture.remote)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &fixture.repo,
+        &["config", "core.sshCommand", &quote(&server)],
+    );
+    git(&fixture.repo, &["config", "ssh.variant", "simple"]);
+    git(
+        &fixture.repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://fixture.invalid/repo.git",
+        ],
+    );
+    let output = cli_without_git(&fixture, &["--fetch", "--no-index-refresh"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let repo = only_repository(&report);
+    assert_eq!(repo["fetched"], true, "{repo:#}");
+    assert_eq!(worktree(repo, &done)["removable"], true);
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "origin/main"]).trim(),
+        new
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "origin/stale/child"]).trim(),
+        new
+    );
+    assert!(
+        !fixture
+            .repo
+            .join(".git/refs/remotes/origin/stale")
+            .is_file()
+    );
+    assert_eq!(git(&fixture.repo, &["rev-parse", "stale"]).trim(), old);
+    assert_eq!(git(&fixture.repo, &["rev-parse", "preserved"]).trim(), old);
+    assert_eq!(
+        git(&fixture.repo, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+        "refs/remotes/origin/main"
+    );
+
+    fs::write(&server, "#!/bin/sh\nexit 1\n").unwrap();
+    let failed = cli_without_git(&fixture, &["--fetch", "--no-index-refresh"]);
+    assert!(!failed.status.success());
+    let failed: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    let repo = only_repository(&failed);
+    assert_eq!(repo["fetched"], false);
+    assert_eq!(repo["remotes"][0]["issue"], "refresh failed");
+    assert_eq!(worktree(repo, &done)["removable"], false);
 }
 
 #[test]
@@ -418,8 +649,8 @@ mod live_output {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    // Always unblock fixture Git, including when an assertion panics. Only this
-    // test's child receives the wrapper PATH; parallel tests use ordinary Git.
+    // Always unblock the fixture's status filter, including when an assertion
+    // panics. Only this test's child receives the gate environment variables.
     struct GatedChild {
         child: Child,
         release: PathBuf,
@@ -435,7 +666,7 @@ mod live_output {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "scanner did not exit after releasing Git"
+                    "scanner did not exit after releasing the status filter"
                 );
                 thread::sleep(Duration::from_millis(10));
             }
@@ -474,47 +705,44 @@ mod live_output {
                 "https://example.invalid/fast.git",
             ],
         );
-        let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-            .map(|directory| directory.join("git"))
-            .find(|path| path.is_file())
-            .and_then(|path| fs::canonicalize(path).ok())
-            .expect("real Git in PATH");
-        let bin = fixture._temp.path().join("test-bin");
-        fs::create_dir(&bin).unwrap();
-        let wrapper = bin.join("git");
         fs::write(
-            &wrapper,
+            fixture.repo.join(".gitattributes"),
+            "tracked.txt filter=gate\n",
+        )
+        .unwrap();
+        git(&fixture.repo, &["add", ".gitattributes"]);
+        git(&fixture.repo, &["commit", "-m", "Configure status filter"]);
+        let filter = fixture.repo.join(".git/test-status-filter");
+        fs::write(
+            &filter,
             r#"#!/bin/sh
-repo=
-expect_path=false
-is_status=false
-for argument do
-    if [ "$expect_path" = true ]; then
-        repo=$argument
-        expect_path=false
-    else
-        case "$argument" in
-            -C) expect_path=true ;;
-            status) is_status=true ;;
-        esac
-    fi
-done
-if [ "$repo" = "$TEST_SLOW_REPO" ] && [ "$is_status" = true ]; then
+if [ -n "$TEST_GATE_REACHED" ]; then
     : > "$TEST_GATE_REACHED"
     while [ ! -e "$TEST_RELEASE_GATE" ]; do
         kill -0 "$PPID" 2>/dev/null || exit 1
         sleep 0.01
     done
 fi
-exec "$TEST_REAL_GIT" "$@"
+cat
 "#,
         )
         .unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
-        let release = fixture._temp.path().join("release-git");
-        let reached = fixture._temp.path().join("git-is-waiting");
-        let mut paths = vec![bin];
-        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        fs::set_permissions(&filter, fs::Permissions::from_mode(0o755)).unwrap();
+        let filter_command = format!("'{}'", filter.to_str().unwrap().replace('\'', "'\\''"));
+        git(
+            &fixture.repo,
+            &["config", "filter.gate.clean", &filter_command],
+        );
+        git(&fixture.repo, &["config", "filter.gate.required", "true"]);
+        fs::File::open(fixture.repo.join("tracked.txt"))
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+        let release = fixture._temp.path().join("release-filter");
+        let reached = fixture._temp.path().join("filter-is-waiting");
         let mut command = Command::new(env!("CARGO_BIN_EXE_git-unpushed"));
         isolate_git(&mut command);
         command
@@ -526,10 +754,7 @@ exec "$TEST_REAL_GIT" "$@"
                 "--jobs=2",
                 "--color=never",
             ])
-            .env("PATH", std::env::join_paths(paths).unwrap())
             .env("COLUMNS", "120")
-            .env("TEST_REAL_GIT", real_git)
-            .env("TEST_SLOW_REPO", &fixture.repo)
             .env("TEST_RELEASE_GATE", &release)
             .env("TEST_GATE_REACHED", &reached)
             .stdout(Stdio::piped())
@@ -572,7 +797,7 @@ exec "$TEST_REAL_GIT" "$@"
 
         let first = stdout_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("fast repository must be printed before releasing slow Git");
+            .expect("fast repository must be printed before releasing the status filter");
         assert!(
             String::from_utf8_lossy(&first).contains("z-fast:"),
             "completed repository must stream first: {}",
@@ -584,12 +809,15 @@ exec "$TEST_REAL_GIT" "$@"
         }
         assert!(
             reached.exists(),
-            "slow repository must have reached gated Git status"
+            "slow repository must have reached the status filter"
         );
-        assert!(!child.release.exists(), "slow Git must still be blocked");
+        assert!(
+            !child.release.exists(),
+            "status filter must still be blocked"
+        );
 
         // Discard earlier discovery/scan updates, then require live frames while
-        // there are no completions or Git output to wake the rendering thread.
+        // there are no completions or filter output to wake the rendering thread.
         while stderr_rx.try_recv().is_ok() {}
         let deadline = Instant::now() + Duration::from_millis(350);
         let mut live_progress = Vec::new();
@@ -597,7 +825,7 @@ exec "$TEST_REAL_GIT" "$@"
             match stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => live_progress.extend(chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(error) => panic!("scanner closed stderr while Git was blocked: {error}"),
+                Err(error) => panic!("scanner closed stderr while the filter was blocked: {error}"),
             }
         }
         assert!(
@@ -607,7 +835,7 @@ exec "$TEST_REAL_GIT" "$@"
         );
         assert!(
             String::from_utf8_lossy(&live_progress).contains("Scanning 1/2 repos"),
-            "progress must show completed repository counts while Git is blocked: {:?}",
+            "progress must show completed repository counts while the filter is blocked: {:?}",
             String::from_utf8_lossy(&live_progress)
         );
 
@@ -652,6 +880,144 @@ fn integrated_worktree_with_ignored_data_is_deleted_and_branch_is_retained() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn normal_deletion_and_preview_need_no_git_executable() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("done");
+    fs::write(tree.join("ignored.txt"), "Disposable ignored content\n").unwrap();
+    fixture.nonlocal_remote();
+    let preview = cli_without_git(&fixture, &["--delete", "--dry-run", "--no-index-refresh"]);
+    assert!(preview.status.success(), "{preview:?}");
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        worktree(only_repository(&preview), &tree)["deletion"]["status"],
+        "would_delete"
+    );
+    assert!(tree.exists());
+
+    let removed = cli_without_git(&fixture, &["--delete", "--no-index-refresh"]);
+    assert!(removed.status.success(), "{removed:?}");
+    let removed: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(
+        worktree(only_repository(&removed), &tree)["deletion"]["status"],
+        "deleted"
+    );
+    assert_eq!(removed["deletion_summary"]["worktrees"], 1);
+    assert!(removed["deletion_summary"]["files"].as_u64().unwrap() > 1);
+    assert!(removed["deletion_summary"]["bytes"].as_u64().unwrap() > 0);
+    assert!(!tree.exists());
+    assert!(fixture.repo.exists());
+    git(&fixture.repo, &["show-ref", "--verify", "refs/heads/done"]);
+}
+
+fn inventory(path: &Path) -> (u64, u64) {
+    walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .map(|entry| {
+            let metadata = fs::symlink_metadata(entry.unwrap().path()).unwrap();
+            if metadata.is_dir() {
+                (0, 0)
+            } else {
+                (1, metadata.len())
+            }
+        })
+        .fold((0, 0), |(files, bytes), entry| {
+            (files + entry.0, bytes + entry.1)
+        })
+}
+
+#[test]
+fn deletion_totals_include_ignored_files_links_and_private_registration() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("counted");
+    fs::create_dir_all(tree.join("ignored/empty")).unwrap();
+    fs::write(tree.join("ignored/data"), vec![b'x'; 4096]).unwrap();
+    #[cfg(unix)]
+    {
+        let outside = fixture.outside.join("keep.txt");
+        fs::write(&outside, vec![b'y'; 10000]).unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("ignored/link")).unwrap();
+    }
+    fixture.nonlocal_remote();
+    let private = PathBuf::from(git(&tree, &["rev-parse", "--absolute-git-dir"]).trim());
+    let checkout = inventory(&tree);
+    let registration = inventory(&private);
+    let expected = (checkout.0 + registration.0, checkout.1 + registration.1);
+    // Index refresh may rewrite registration files. Keep this exact-byte
+    // fixture unchanged between its independent inventory and removal.
+    let preview = json(
+        &fixture.scan,
+        &["--delete", "--dry-run", "--no-index-refresh"],
+    );
+    assert_eq!(preview["deletion_summary"]["dry_run"], true);
+    assert_eq!(preview["deletion_summary"]["worktrees"], 1);
+    assert_eq!(preview["deletion_summary"]["files"], expected.0);
+    assert_eq!(preview["deletion_summary"]["bytes"], expected.1);
+    assert!(tree.exists() && private.exists());
+    let removed = json(&fixture.scan, &["--delete", "--no-index-refresh"]);
+    assert_eq!(removed["deletion_summary"]["dry_run"], false);
+    assert_eq!(removed["deletion_summary"]["files"], expected.0);
+    assert_eq!(removed["deletion_summary"]["bytes"], expected.1);
+    assert_eq!(
+        worktree(only_repository(&removed), &tree)["deletion"]["stats"]["bytes"],
+        expected.1
+    );
+    assert!(!tree.exists() && !private.exists());
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read(fixture.outside.join("keep.txt")).unwrap().len(),
+        10000
+    );
+}
+
+#[test]
+fn deletion_size_opt_out_keeps_file_counts_and_reports_no_bytes() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("files-only");
+    fixture.nonlocal_remote();
+    let report = json(&fixture.scan, &["--delete", "--no-delete-size"]);
+    assert_eq!(report["deletion_summary"]["worktrees"], 1);
+    assert!(report["deletion_summary"]["files"].as_u64().unwrap() > 0);
+    assert!(report["deletion_summary"]["bytes"].is_null());
+    assert!(worktree(only_repository(&report), &tree)["deletion"]["stats"]["bytes"].is_null());
+    let invalid = cli(&fixture.scan, &["--no-delete-size"]);
+    assert_eq!(invalid.status.code(), Some(2));
+}
+
+#[test]
+fn deletion_summary_is_the_last_line_in_streamed_and_buffered_output() {
+    for stream in ["--stream=always", "--stream=never"] {
+        let fixture = Fixture::new();
+        let tree = fixture.tree("large");
+        fs::File::create(tree.join("ignored.txt"))
+            .unwrap()
+            .set_len(3 * 1024 * 1024 * 1024)
+            .unwrap();
+        fixture.nonlocal_remote();
+        let output = cli(&fixture.scan, &["--delete", stream, "--color=never"]);
+        assert!(output.status.success(), "{output:?}");
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("Deleted 1 worktree · ")
+        );
+        assert!(output.lines().last().unwrap().ends_with("3.0 GiB"));
+        assert_eq!(output.matches("Deleted 1 worktree").count(), 1);
+    }
+    let fixture = Fixture::new();
+    let output = cli(&fixture.scan, &["--delete", "--no-delete-size"]);
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .ends_with("Deleted 0 worktrees · 0 files\n")
+    );
+}
+
 #[test]
 fn discovery_from_a_linked_checkout_can_delete_that_checkout_and_its_siblings() {
     let fixture = Fixture::new();
@@ -686,6 +1052,110 @@ fn keep_ignored_prevents_deletion() {
     assert_eq!(tree_report["ignored"], true);
     assert_eq!(tree_report["removable"], false);
     assert!(tree.join("ignored.txt").exists());
+}
+
+#[test]
+fn packed_refs_and_symbolic_chains_keep_remote_integration_and_stashes() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("done");
+    git(
+        &fixture.repo,
+        &["tag", "-a", "release", "-m", "Annotated tag"],
+    );
+    git(&fixture.repo, &["pack-refs", "--all"]);
+    git(
+        &fixture.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/alias",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(
+        &fixture.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/alias",
+        ],
+    );
+    fs::write(fixture.repo.join("tracked.txt"), "stashed data\n").unwrap();
+    git(&fixture.repo, &["stash", "push", "-m", "Keep local data"]);
+    fixture.nonlocal_remote();
+    let report = json(&fixture.scan, &["--delete", "--dry-run"]);
+    let repository = only_repository(&report);
+    assert_eq!(repository["stashes"], true);
+    assert_eq!(
+        repository["remotes"][0]["default_branch"],
+        "refs/remotes/origin/main"
+    );
+    assert_eq!(
+        worktree(repository, &tree)["deletion"]["status"],
+        "would_delete"
+    );
+
+    // Git omits dangling symbolic refs. The metadata reader must fall back
+    // without changing the rest of the repository's scan results.
+    git(
+        &fixture.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/dangling",
+            "refs/remotes/origin/missing",
+        ],
+    );
+    let dangling = json(&fixture.scan, &["--delete", "--dry-run"]);
+    assert_eq!(only_repository(&dangling), repository);
+}
+
+#[test]
+fn split_index_visibility_flags_still_protect_hidden_edits() {
+    let fixture = Fixture::new();
+    let hidden = fixture.tree("hidden");
+    let clean = fixture.tree("clean");
+    git(
+        &hidden,
+        &["update-index", "--assume-unchanged", "tracked.txt"],
+    );
+    git(&hidden, &["update-index", "--split-index"]);
+    git(&clean, &["update-index", "--split-index"]);
+    fs::write(hidden.join("tracked.txt"), "hidden data\n").unwrap();
+    fixture.nonlocal_remote();
+    let (_, report) = report_even_if_error(&fixture.scan, &["--delete", "--dry-run"]);
+    let repository = only_repository(&report);
+    assert_eq!(worktree(repository, &hidden)["removable"], false);
+    assert_eq!(
+        worktree(repository, &clean)["deletion"]["status"],
+        "would_delete"
+    );
+    assert_eq!(
+        fs::read_to_string(hidden.join("tracked.txt")).unwrap(),
+        "hidden data\n"
+    );
+}
+
+#[test]
+fn reftable_repositories_use_the_native_metadata_fallback() {
+    let fixture = Fixture::new();
+    let migration = git_output(
+        &fixture.repo,
+        &[
+            OsStr::new("refs"),
+            OsStr::new("migrate"),
+            OsStr::new("--ref-format=reftable"),
+        ],
+    );
+    if !migration.status.success() {
+        // Older Git releases do not support this format.
+        return;
+    }
+    let tree = fixture.tree("done");
+    fixture.nonlocal_remote();
+    let report = json(&fixture.scan, &["--delete", "--dry-run"]);
+    assert_eq!(
+        worktree(only_repository(&report), &tree)["deletion"]["status"],
+        "would_delete"
+    );
 }
 
 #[test]
