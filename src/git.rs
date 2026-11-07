@@ -256,22 +256,17 @@ fn seed_from_metadata(path: &Path) -> Option<RepositorySeed> {
 }
 
 pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
-    let output = command(
-        repo_path,
-        &[
-            "-c",
-            "status.showUntrackedFiles=all",
-            "-c",
-            "diff.ignoreSubmodules=none",
-            "worktree",
-            "remove",
-            "--",
-        ],
-    )
-    .arg(worktree_path)
-    .output()
-    .context("could not start Git")?;
-    checked(output, "worktree remove").map(|_| ())
+    let result = crate::removal::remove_worktree(repo_path, worktree_path, false);
+    if matches!(result.status, crate::model::DeletionStatus::Deleted) {
+        Ok(())
+    } else {
+        bail!(
+            "{}",
+            result
+                .reason
+                .unwrap_or_else(|| "worktree removal failed".into())
+        )
+    }
 }
 
 pub(crate) fn trim_newline(bytes: &[u8]) -> &[u8] {

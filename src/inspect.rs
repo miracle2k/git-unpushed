@@ -579,7 +579,7 @@ fn worktree_git_dir(path: &Path) -> Result<PathBuf> {
         .context("cannot resolve linked Git directory")
 }
 
-fn initialized_submodules(path: &Path) -> Result<bool> {
+pub(crate) fn initialized_submodules(path: &Path) -> Result<bool> {
     let output = metadata::or_native(metadata::submodule_config(path), || {
         git::run_optional(
             path,

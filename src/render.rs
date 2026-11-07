@@ -1,4 +1,4 @@
-use crate::model::{DeletionStatus, RepositoryReport, ScanReport, WorktreeReport};
+use crate::model::{DeletionStatus, DeletionSummary, RepositoryReport, ScanReport, WorktreeReport};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
@@ -13,6 +13,50 @@ pub struct RenderOptions {
 
 pub fn repository_label_width(path: &Path) -> usize {
     UnicodeWidthStr::width(short_path(path).as_str()) + 1
+}
+
+pub fn render_deletion_summary(summary: &DeletionSummary) -> String {
+    let verb = if summary.dry_run {
+        "Would delete"
+    } else {
+        "Deleted"
+    };
+    let trees = if summary.worktrees == 1 {
+        "worktree"
+    } else {
+        "worktrees"
+    };
+    let files = if summary.files == 1 { "file" } else { "files" };
+    let mut output = format!(
+        "{verb} {} {trees} · {} {files}",
+        summary.worktrees, summary.files
+    );
+    if let Some(bytes) = summary.bytes {
+        let _ = write!(output, " · {}", human_bytes(bytes));
+    }
+    if summary.failed != 0 {
+        let _ = write!(output, " · {} failed", summary.failed);
+    }
+    if summary.skipped != 0 {
+        let _ = write!(output, " · {} skipped", summary.skipped);
+    }
+    output.push('\n');
+    output
+}
+
+fn human_bytes(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", units[unit])
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -441,6 +485,7 @@ mod tests {
             }],
             errors: Vec::new(),
             elapsed_ms: 1,
+            deletion_summary: None,
         }
     }
 
@@ -543,6 +588,7 @@ mod tests {
         removed.deletion = Some(DeletionResult {
             status: DeletionStatus::Deleted,
             reason: None,
+            stats: None,
         });
         let output = render(
             &report(vec![worktree("/projects/api", true), dirty, removed]),
@@ -554,6 +600,35 @@ mod tests {
         assert!(!output.contains("auth"));
         assert!(output.contains("docs:"));
         assert!(output.contains("D · deleted"));
+    }
+
+    #[test]
+    fn summary_includes_partial_file_removals_without_counting_failed_worktrees() {
+        use crate::model::DeletionStats;
+        let mut removed = worktree("/worktrees/done", false);
+        removed.deletion = Some(DeletionResult {
+            status: DeletionStatus::Deleted,
+            reason: None,
+            stats: Some(DeletionStats {
+                files: 10,
+                bytes: Some(2048),
+            }),
+        });
+        let mut partial = worktree("/worktrees/partial", false);
+        partial.deletion = Some(DeletionResult {
+            status: DeletionStatus::Failed,
+            reason: Some("permission denied".into()),
+            stats: Some(DeletionStats {
+                files: 3,
+                bytes: Some(1024),
+            }),
+        });
+        let report = report(vec![removed, partial]);
+        let summary = DeletionSummary::from_repositories(&report.repositories, false, true);
+        assert_eq!(
+            render_deletion_summary(&summary),
+            "Deleted 1 worktree · 13 files · 3.0 KiB · 1 failed\n"
+        );
     }
 
     #[test]

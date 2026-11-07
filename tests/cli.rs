@@ -880,6 +880,108 @@ fn integrated_worktree_with_ignored_data_is_deleted_and_branch_is_retained() {
     );
 }
 
+fn inventory(path: &Path) -> (u64, u64) {
+    walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .map(|entry| {
+            let metadata = fs::symlink_metadata(entry.unwrap().path()).unwrap();
+            if metadata.is_dir() {
+                (0, 0)
+            } else {
+                (1, metadata.len())
+            }
+        })
+        .fold((0, 0), |(files, bytes), entry| {
+            (files + entry.0, bytes + entry.1)
+        })
+}
+
+#[test]
+fn deletion_totals_include_ignored_files_links_and_private_registration() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("counted");
+    fs::create_dir_all(tree.join("ignored/empty")).unwrap();
+    fs::write(tree.join("ignored/data"), vec![b'x'; 4096]).unwrap();
+    #[cfg(unix)]
+    {
+        let outside = fixture.outside.join("keep.txt");
+        fs::write(&outside, vec![b'y'; 10000]).unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("ignored/link")).unwrap();
+    }
+    fixture.nonlocal_remote();
+    let private = PathBuf::from(git(&tree, &["rev-parse", "--absolute-git-dir"]).trim());
+    let checkout = inventory(&tree);
+    let registration = inventory(&private);
+    let expected = (checkout.0 + registration.0, checkout.1 + registration.1);
+    let preview = json(&fixture.scan, &["--delete", "--dry-run"]);
+    assert_eq!(preview["deletion_summary"]["dry_run"], true);
+    assert_eq!(preview["deletion_summary"]["worktrees"], 1);
+    assert_eq!(preview["deletion_summary"]["files"], expected.0);
+    assert_eq!(preview["deletion_summary"]["bytes"], expected.1);
+    assert!(tree.exists() && private.exists());
+    let removed = json(&fixture.scan, &["--delete"]);
+    assert_eq!(removed["deletion_summary"]["dry_run"], false);
+    assert_eq!(removed["deletion_summary"]["files"], expected.0);
+    assert_eq!(removed["deletion_summary"]["bytes"], expected.1);
+    assert_eq!(
+        worktree(only_repository(&removed), &tree)["deletion"]["stats"]["bytes"],
+        expected.1
+    );
+    assert!(!tree.exists() && !private.exists());
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read(fixture.outside.join("keep.txt")).unwrap().len(),
+        10000
+    );
+}
+
+#[test]
+fn deletion_size_opt_out_keeps_file_counts_and_reports_no_bytes() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("files-only");
+    fixture.nonlocal_remote();
+    let report = json(&fixture.scan, &["--delete", "--no-delete-size"]);
+    assert_eq!(report["deletion_summary"]["worktrees"], 1);
+    assert!(report["deletion_summary"]["files"].as_u64().unwrap() > 0);
+    assert!(report["deletion_summary"]["bytes"].is_null());
+    assert!(worktree(only_repository(&report), &tree)["deletion"]["stats"]["bytes"].is_null());
+    let invalid = cli(&fixture.scan, &["--no-delete-size"]);
+    assert_eq!(invalid.status.code(), Some(2));
+}
+
+#[test]
+fn deletion_summary_is_the_last_line_in_streamed_and_buffered_output() {
+    for stream in ["--stream=always", "--stream=never"] {
+        let fixture = Fixture::new();
+        let tree = fixture.tree("large");
+        fs::File::create(tree.join("ignored.txt"))
+            .unwrap()
+            .set_len(3 * 1024 * 1024 * 1024)
+            .unwrap();
+        fixture.nonlocal_remote();
+        let output = cli(&fixture.scan, &["--delete", stream, "--color=never"]);
+        assert!(output.status.success(), "{output:?}");
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("Deleted 1 worktree · ")
+        );
+        assert!(output.lines().last().unwrap().ends_with("3.0 GiB"));
+        assert_eq!(output.matches("Deleted 1 worktree").count(), 1);
+    }
+    let fixture = Fixture::new();
+    let output = cli(&fixture.scan, &["--delete", "--no-delete-size"]);
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .ends_with("Deleted 0 worktrees · 0 files\n")
+    );
+}
+
 #[test]
 fn discovery_from_a_linked_checkout_can_delete_that_checkout_and_its_siblings() {
     let fixture = Fixture::new();

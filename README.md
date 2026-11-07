@@ -84,6 +84,7 @@ Unconfirmed work stays `U`; that does not necessarily mean it was never merged.
 ```sh
 git unpushed --delete --dry-run ~/src  # Preview
 git unpushed --delete ~/src           # Remove eligible worktrees
+git unpushed --delete --no-delete-size ~/src  # Count files without collecting sizes
 ```
 
 Deletion removes checkout directories and their worktree registrations, retaining
@@ -95,6 +96,20 @@ By default, worktrees must be clean and provably integrated into a qualifying
 remote mainline. Dirty, locked, uncertain, or otherwise protected worktrees are
 skipped, as are primary checkouts and the worktree containing the current working
 directory. Eligibility is checked again immediately before removal.
+
+Deletion ends with a total such as `Deleted 3 worktrees · 42817 files · 1.8 GiB`.
+Totals include checkout files, ignored files, symbolic links, and the removed
+worktree registrations. Branches and shared repository objects are retained.
+File counts come from successful removals; partial failures contribute only the
+files already removed. `--json` includes per-worktree `deletion.stats` and a
+report-wide `deletion_summary`.
+
+Byte totals are logical file lengths measured before removal, including link
+lengths, and can differ from disk space recovered with sparse files, hard links,
+compression, or snapshots. `--no-delete-size` skips file-size collection and
+reports only file and worktree counts (`bytes: null` in JSON). Dry runs show
+estimated totals without deleting files. Measurement and removal do not follow
+symbolic links or cross mounted filesystems.
 
 | Option | Effect |
 | --- | --- |
@@ -134,3 +149,13 @@ The helper alternates the binaries, checks that their JSON reports and exit code
 match (excluding elapsed time), and reports median scan times and binary sizes.
 Use `--runs 5` for more samples. Close other tools that modify the scanned
 repositories during the comparison.
+
+To compare native Git removal, removal with file counts, and removal with file
+and byte counts on disposable worktrees:
+
+```sh
+cargo run --release --example benchmark_removal -- --files 10000 --runs 5
+```
+
+This creates its own temporary repository, rotates the three modes, and excludes
+fixture creation from the timings. It does not remove any existing worktrees.

@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use git_unpushed::model::{
-    DeletionResult, DeletionStatus, RepositoryReport, RepositorySeed, ScanOptions, ScanReport,
+    DeletionResult, DeletionStatus, DeletionSummary, RepositoryReport, RepositorySeed, ScanOptions,
+    ScanReport,
 };
 use git_unpushed::render::{self, RenderOptions};
-use git_unpushed::{discovery, git, inspect};
+use git_unpushed::{discovery, git, inspect, removal};
 use rayon::prelude::*;
 use std::io::{self, IsTerminal, Write};
 use std::num::NonZeroUsize;
@@ -63,6 +64,10 @@ struct Cli {
     /// Preview deletion without removing anything
     #[arg(long, requires = "delete")]
     dry_run: bool,
+
+    /// Count removed files without reading their sizes
+    #[arg(long, requires = "delete")]
+    no_delete_size: bool,
 
     /// Also allow clean worktrees backed up remotely but not integrated into mainline
     #[arg(long)]
@@ -209,6 +214,7 @@ fn execute(cli: Cli) -> Result<bool> {
         let cancelled = &cancelled;
         let delete = cli.delete;
         let dry_run = cli.dry_run;
+        let collect_size = !cli.no_delete_size;
         let worker = scope.spawn(move || {
             pool.install(|| {
                 seeds.par_iter().for_each_with(sender, |sender, seed| {
@@ -233,7 +239,14 @@ fn execute(cli: Cli) -> Result<bool> {
                         })
                         .unwrap_or_else(|error| failed_repository(seed, error));
                     if delete && !cancelled.load(Ordering::Relaxed) {
-                        delete_eligible(&mut repository, options, dry_run, cancelled, progress);
+                        delete_eligible(
+                            &mut repository,
+                            options,
+                            dry_run,
+                            collect_size,
+                            cancelled,
+                            progress,
+                        );
                     }
                     completed.fetch_add(1, Ordering::Relaxed);
                     let _ = sender.send(repository);
@@ -278,14 +291,18 @@ fn execute(cli: Cli) -> Result<bool> {
     repositories.sort_by(|left, right| left.path.cmp(&right.path));
     let scan_elapsed = scan_started.elapsed();
     progress.finish();
+    let deletion_summary = cli.delete.then(|| {
+        DeletionSummary::from_repositories(&repositories, cli.dry_run, !cli.no_delete_size)
+    });
     let report = ScanReport {
         repositories,
         errors,
         elapsed_ms: started.elapsed().as_millis(),
+        deletion_summary,
     };
     let has_errors =
         !report.errors.is_empty() || report.repositories.iter().any(RepositoryReport::has_errors);
-    let output = if cli.json {
+    let mut output = if cli.json {
         serde_json::to_string_pretty(&report)? + "\n"
     } else if !streamed_any {
         render::render(&report, render_options)
@@ -297,10 +314,16 @@ fn execute(cli: Cli) -> Result<bool> {
                 repositories: Vec::new(),
                 errors: report.errors.clone(),
                 elapsed_ms: report.elapsed_ms,
+                deletion_summary: None,
             },
             render_options,
         )
     };
+    if !cli.json
+        && let Some(summary) = &report.deletion_summary
+    {
+        output.push_str(&render::render_deletion_summary(summary));
+    }
     io::stdout().lock().write_all(output.as_bytes())?;
     if cli.timings {
         eprintln!(
@@ -335,6 +358,7 @@ fn delete_eligible(
     repository: &mut RepositoryReport,
     options: &ScanOptions,
     dry_run: bool,
+    collect_size: bool,
     cancelled: &AtomicBool,
     progress: &progress::Progress,
 ) {
@@ -358,21 +382,24 @@ fn delete_eligible(
         match inspect::revalidate_worktree(repository, &original, options) {
             Ok(mut current) if current.removable => {
                 let result = if dry_run {
-                    DeletionResult {
-                        status: DeletionStatus::WouldDelete,
-                        reason: None,
-                    }
-                } else {
-                    match git::remove_worktree(&repository.common_dir, &current.path) {
-                        Ok(()) => DeletionResult {
-                            status: DeletionStatus::Deleted,
+                    match removal::preview_worktree(
+                        &repository.common_dir,
+                        &current.path,
+                        collect_size,
+                    ) {
+                        Ok(stats) => DeletionResult {
+                            status: DeletionStatus::WouldDelete,
                             reason: None,
+                            stats: Some(stats),
                         },
                         Err(error) => DeletionResult {
                             status: DeletionStatus::Failed,
-                            reason: Some(format!("{error:#}")),
+                            reason: Some(format!("preview failed: {error:#}")),
+                            stats: None,
                         },
                     }
+                } else {
+                    removal::remove_worktree(&repository.common_dir, &current.path, collect_size)
                 };
                 current.deletion = Some(result);
                 repository.worktrees[index] = current;
@@ -380,6 +407,7 @@ fn delete_eligible(
             Ok(mut current) => {
                 current.deletion = Some(DeletionResult {
                     status: DeletionStatus::Skipped,
+                    stats: None,
                     reason: current
                         .reason
                         .clone()
@@ -391,6 +419,7 @@ fn delete_eligible(
                 repository.worktrees[index].removable = false;
                 repository.worktrees[index].deletion = Some(DeletionResult {
                     status: DeletionStatus::Failed,
+                    stats: None,
                     reason: Some(format!("revalidation failed: {error:#}")),
                 });
             }
