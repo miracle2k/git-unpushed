@@ -117,6 +117,41 @@ pub(crate) fn has_hidden_index_entries(path: &Path) -> Result<bool> {
     })
 }
 
+/// The status inspection already resolved the private Git directory and read
+/// HEAD with native Git. Reuse those facts instead of reopening the repository.
+pub(crate) fn has_hidden_index_entries_at(
+    path: &Path,
+    git_dir: &Path,
+    head: Option<&str>,
+) -> Result<bool> {
+    let kind = match head.map(str::len) {
+        Some(40) => gix::hash::Kind::Sha1,
+        Some(64) => gix::hash::Kind::Sha256,
+        _ => return has_hidden_index_entries(path),
+    };
+    let cached = (|| -> Result<bool> {
+        let index = gix::index::File::at(git_dir.join("index"), kind, false, Default::default())
+            .map_err(|_| anyhow::anyhow!("cannot read index"))?;
+        if index.link().is_some() || index.is_sparse() {
+            anyhow::bail!("index requires native Git");
+        }
+        let hidden =
+            gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE;
+        Ok(index
+            .entries()
+            .iter()
+            .any(|entry| entry.flags.intersects(hidden)))
+    })();
+    cached.or_else(|_| {
+        let output = run(path, &["ls-files", "-v", "-z"])?;
+        Ok(output.split(|byte| *byte == 0).any(|field| {
+            field
+                .first()
+                .is_some_and(|tag| tag.is_ascii_lowercase() || *tag == b'S')
+        }))
+    })
+}
+
 pub(crate) fn run_optional(path: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
     let output = command(path, args)
         .output()

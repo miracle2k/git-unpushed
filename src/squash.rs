@@ -71,12 +71,34 @@ pub(crate) fn detect(
     // same head/base delta whenever several tips share it.
     let mut deltas: Vec<Delta> = Vec::new();
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    let repository = git::open_metadata(path).ok();
+    let cache = repository
+        .as_ref()
+        .and_then(|repo| repo.commit_graph_if_enabled().ok().flatten());
+    let mut graph = repository
+        .as_ref()
+        .map(|repo| repo.revision_graph(cache.as_ref()));
+    let mut merge_bases = |tip: &str, head: &str| -> Result<Vec<String>> {
+        let cached = (|| {
+            let repo = repository.as_ref()?;
+            let graph = graph.as_mut()?;
+            let tip = gix::hash::ObjectId::from_hex(tip.as_bytes()).ok()?;
+            let head = gix::hash::ObjectId::from_hex(head.as_bytes()).ok()?;
+            repo.merge_bases_many_with_graph(tip, &[head], graph)
+                .ok()
+                .map(|bases| bases.into_iter().map(|id| id.to_string()).collect())
+        })();
+        if let Some(bases) = cached {
+            return Ok(bases);
+        }
+        match git::run_optional(path, &["merge-base", "--all", tip, head])? {
+            Some(raw) => parse_oids(&raw),
+            None => Ok(Vec::new()),
+        }
+    };
     for head in ordered_heads {
         for (tip_index, tip) in tips.iter().enumerate() {
-            let Some(raw) = git::run_optional(path, &["merge-base", "--all", tip, head])? else {
-                continue; // Unrelated histories cannot establish this proof.
-            };
-            let bases = parse_oids(&raw)?;
+            let bases = merge_bases(tip, head)?;
             if bases.len() != 1 {
                 continue; // Do not pick one arbitrarily in criss-cross history.
             }

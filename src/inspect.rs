@@ -538,7 +538,7 @@ fn inspect_status(
     // These index flags deliberately suppress status checks, so a clean status
     // cannot establish that deleting the tracked files preserves user data.
     if !entry.primary && !entry.modified && !entry.untracked && entry.errors.is_empty() {
-        match git::has_hidden_index_entries(&entry.path) {
+        match git::has_hidden_index_entries_at(&entry.path, &git_dir, entry.head.as_deref()) {
             Ok(hidden) => {
                 if hidden {
                     entry.errors.push("index has assume-unchanged or skip-worktree flags; file cleanliness is unproven".into());
