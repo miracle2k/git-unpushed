@@ -538,13 +538,9 @@ fn inspect_status(
     // These index flags deliberately suppress status checks, so a clean status
     // cannot establish that deleting the tracked files preserves user data.
     if !entry.primary && !entry.modified && !entry.untracked && entry.errors.is_empty() {
-        match git::run(&entry.path, &["ls-files", "-v", "-z"]) {
-            Ok(output) => {
-                if output.split(|byte| *byte == 0).any(|field| {
-                    field
-                        .first()
-                        .is_some_and(|tag| tag.is_ascii_lowercase() || *tag == b'S')
-                }) {
+        match git::has_hidden_index_entries(&entry.path) {
+            Ok(hidden) => {
+                if hidden {
                     entry.errors.push("index has assume-unchanged or skip-worktree flags; file cleanliness is unproven".into());
                 }
             }
@@ -675,6 +671,56 @@ fn assess_removal(entry: &mut WorktreeReport, options: &ScanOptions) {
 }
 
 fn load_references(path: &Path) -> Result<HashMap<String, Reference>> {
+    references_from_metadata(path).or_else(|_| references_from_git(path))
+}
+
+fn references_from_metadata(path: &Path) -> Result<HashMap<String, Reference>> {
+    let repository = git::open_metadata(path)?;
+    let platform = repository
+        .references()
+        .map_err(|_| anyhow::anyhow!("cannot list references"))?;
+    let mut raw = HashMap::new();
+    for reference in platform
+        .all()
+        .map_err(|_| anyhow::anyhow!("cannot list references"))?
+    {
+        let reference = reference.map_err(|_| anyhow::anyhow!("cannot read reference"))?;
+        let name = std::str::from_utf8(reference.name().as_bstr())?.to_owned();
+        let (oid, symbolic) = match reference.target() {
+            gix::refs::TargetRef::Object(oid) => (oid.to_string(), None),
+            gix::refs::TargetRef::Symbolic(name) => (
+                String::new(),
+                Some(std::str::from_utf8(name.as_bstr())?.to_owned()),
+            ),
+        };
+        raw.insert(name, Reference { oid, symbolic });
+    }
+    let mut result = HashMap::with_capacity(raw.len());
+    for (name, reference) in &raw {
+        let mut current_name = name;
+        let mut current = reference;
+        let mut visited = HashSet::new();
+        while let Some(target) = &current.symbolic {
+            if !visited.insert(current_name) {
+                bail!("symbolic reference cycle");
+            }
+            current_name = target;
+            current = raw.get(target).context("unresolved symbolic reference")?;
+        }
+        result.insert(
+            name.clone(),
+            Reference {
+                // Do not peel annotated tags: `for-each-ref %(objectname)` returns
+                // the tag object's ID. Symbolic refs report their final target.
+                oid: current.oid.clone(),
+                symbolic: reference.symbolic.as_ref().map(|_| current_name.clone()),
+            },
+        );
+    }
+    Ok(result)
+}
+
+fn references_from_git(path: &Path) -> Result<HashMap<String, Reference>> {
     let bytes = git::run(
         path,
         &[

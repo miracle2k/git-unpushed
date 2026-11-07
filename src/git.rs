@@ -75,6 +75,48 @@ pub(crate) fn run_status(path: &Path, args: &[&str], refresh_index: bool) -> Res
     checked(output, "status")
 }
 
+/// Read repository metadata without inheriting repository selectors, replacement
+/// objects, namespaces, or alternate object stores from the process environment.
+/// Native Git remains the fallback for unsupported formats and index extensions.
+pub(crate) fn open_metadata(path: &Path) -> Result<gix::Repository> {
+    gix::open_opts(
+        path,
+        gix::open::Options::isolated()
+            .strict_config(true)
+            .lossy_config(true)
+            .config_overrides(["core.useReplaceRefs=false"]),
+    )
+    .map_err(|_| anyhow::anyhow!("could not open repository metadata"))
+}
+
+pub(crate) fn has_hidden_index_entries(path: &Path) -> Result<bool> {
+    let cached = (|| -> Result<bool> {
+        let repository = open_metadata(path)?;
+        let index = repository
+            .index()
+            .map_err(|_| anyhow::anyhow!("cannot read index"))?;
+        // Split indexes require their shared index; sparse directory entries
+        // require expansion to reproduce `ls-files -v`. Let Git handle both.
+        if index.link().is_some() || index.is_sparse() {
+            anyhow::bail!("index requires native Git");
+        }
+        let hidden =
+            gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE;
+        Ok(index
+            .entries()
+            .iter()
+            .any(|entry| entry.flags.intersects(hidden)))
+    })();
+    cached.or_else(|_| {
+        let output = run(path, &["ls-files", "-v", "-z"])?;
+        Ok(output.split(|byte| *byte == 0).any(|field| {
+            field
+                .first()
+                .is_some_and(|tag| tag.is_ascii_lowercase() || *tag == b'S')
+        }))
+    })
+}
+
 pub(crate) fn run_optional(path: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
     let output = command(path, args)
         .output()

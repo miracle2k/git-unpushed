@@ -117,3 +117,15 @@ timings (`--timings`), and color controls.
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+To compare two release builds on stable repositories without refreshing their
+indexes or fetching remotes:
+
+```sh
+cargo run --release --example benchmark_scan -- /path/to/baseline /path/to/candidate /path/to/repos
+```
+
+The helper alternates the binaries, checks that their JSON reports and exit codes
+match (excluding elapsed time), and reports median scan times and binary sizes.
+Use `--runs 5` for more samples. Close other tools that modify the scanned
+repositories during the comparison.

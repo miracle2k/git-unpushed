@@ -689,6 +689,110 @@ fn keep_ignored_prevents_deletion() {
 }
 
 #[test]
+fn packed_refs_and_symbolic_chains_keep_remote_integration_and_stashes() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("done");
+    git(
+        &fixture.repo,
+        &["tag", "-a", "release", "-m", "Annotated tag"],
+    );
+    git(&fixture.repo, &["pack-refs", "--all"]);
+    git(
+        &fixture.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/alias",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(
+        &fixture.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/alias",
+        ],
+    );
+    fs::write(fixture.repo.join("tracked.txt"), "stashed data\n").unwrap();
+    git(&fixture.repo, &["stash", "push", "-m", "Keep local data"]);
+    fixture.nonlocal_remote();
+    let report = json(&fixture.scan, &["--delete", "--dry-run"]);
+    let repository = only_repository(&report);
+    assert_eq!(repository["stashes"], true);
+    assert_eq!(
+        repository["remotes"][0]["default_branch"],
+        "refs/remotes/origin/main"
+    );
+    assert_eq!(
+        worktree(repository, &tree)["deletion"]["status"],
+        "would_delete"
+    );
+
+    // Git omits dangling symbolic refs. The metadata reader must fall back
+    // without changing the rest of the repository's scan results.
+    git(
+        &fixture.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/dangling",
+            "refs/remotes/origin/missing",
+        ],
+    );
+    let dangling = json(&fixture.scan, &["--delete", "--dry-run"]);
+    assert_eq!(only_repository(&dangling), repository);
+}
+
+#[test]
+fn split_index_visibility_flags_still_protect_hidden_edits() {
+    let fixture = Fixture::new();
+    let hidden = fixture.tree("hidden");
+    let clean = fixture.tree("clean");
+    git(
+        &hidden,
+        &["update-index", "--assume-unchanged", "tracked.txt"],
+    );
+    git(&hidden, &["update-index", "--split-index"]);
+    git(&clean, &["update-index", "--split-index"]);
+    fs::write(hidden.join("tracked.txt"), "hidden data\n").unwrap();
+    fixture.nonlocal_remote();
+    let (_, report) = report_even_if_error(&fixture.scan, &["--delete", "--dry-run"]);
+    let repository = only_repository(&report);
+    assert_eq!(worktree(repository, &hidden)["removable"], false);
+    assert_eq!(
+        worktree(repository, &clean)["deletion"]["status"],
+        "would_delete"
+    );
+    assert_eq!(
+        fs::read_to_string(hidden.join("tracked.txt")).unwrap(),
+        "hidden data\n"
+    );
+}
+
+#[test]
+fn reftable_repositories_use_the_native_metadata_fallback() {
+    let fixture = Fixture::new();
+    let migration = git_output(
+        &fixture.repo,
+        &[
+            OsStr::new("refs"),
+            OsStr::new("migrate"),
+            OsStr::new("--ref-format=reftable"),
+        ],
+    );
+    if !migration.status.success() {
+        // Older Git releases do not support this format.
+        return;
+    }
+    let tree = fixture.tree("done");
+    fixture.nonlocal_remote();
+    let report = json(&fixture.scan, &["--delete", "--dry-run"]);
+    assert_eq!(
+        worktree(only_repository(&report), &tree)["deletion"]["status"],
+        "would_delete"
+    );
+}
+
+#[test]
 fn exact_squash_is_reported_as_done_by_default_but_dirty_files_still_block_removal() {
     let fixture = Fixture::new();
     let tree = fixture.tree("squashed");
