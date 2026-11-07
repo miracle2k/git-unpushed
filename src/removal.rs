@@ -1,7 +1,7 @@
 //! Removal traversal adapted from gitoxide's gix-worktree 0.59.0 (MIT).
 //! See LICENSES/gitoxide-MIT.txt. Validation and statistics are local additions.
 use crate::model::{DeletionResult, DeletionStats, DeletionStatus};
-use crate::{git, inspect};
+use crate::{git, inspect, metadata};
 use anyhow::{Context, Result, bail};
 use std::{
     fs, io,
@@ -9,7 +9,7 @@ use std::{
 };
 
 /// Remove a linked checkout and its registration after validating their identity
-/// and checking native Git status. Never remove branches or shared objects.
+/// and checking working-copy status. Never remove branches or shared objects.
 pub fn remove_worktree(common_dir: &Path, worktree: &Path, collect_size: bool) -> DeletionResult {
     let git_dir = match validate(common_dir, worktree) {
         Ok(path) => path,
@@ -112,23 +112,33 @@ fn validate(common_dir: &Path, worktree: &Path) -> Result<PathBuf> {
         Err(error) => return Err(error.into()),
     }
     if git_dir.join("modules").exists()
-        || (worktree.join(".gitmodules").exists() && inspect::initialized_submodules(&worktree)?)
+        || (worktree.join(".gitmodules").exists()
+            && inspect::initialized_submodules(&worktree)
+                .map_err(|_| anyhow::anyhow!("could not verify submodule state"))?)
     {
         bail!("worktree contains initialized submodules");
     }
-    let status = git::run_status(
-        &worktree,
-        &[
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-            "--no-renames",
-        ],
-        false,
-    )?;
-    if !status.is_empty() {
+    let clean = metadata::or_native(
+        metadata::status(&worktree, false)
+            .map(|status| !status.modified && !status.untracked && !status.conflicts),
+        || {
+            git::run_status(
+                &worktree,
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none",
+                    "--no-renames",
+                ],
+                false,
+            )
+            .map(|status| status.is_empty())
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("could not verify working-copy status"))?;
+    if !clean {
         bail!("worktree contains modified or untracked files");
     }
     if git::has_hidden_index_entries(&worktree)? {

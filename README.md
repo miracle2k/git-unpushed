@@ -19,7 +19,7 @@ Only items needing attention are shown by default.
 
 Building requires Rust 1.91 or newer. Normal scans and remote refreshes use Gix
 inside the process; run `git-unpushed` directly when Git is not installed.
-Git is still needed for `--deep`, worktree deletion, and compatibility fallbacks
+Git is still needed for `--deep` and compatibility fallbacks
 such as reftable repositories. Configured filters, credential helpers, and SSH
 transports can also require external programs.
 

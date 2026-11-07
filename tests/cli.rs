@@ -880,6 +880,37 @@ fn integrated_worktree_with_ignored_data_is_deleted_and_branch_is_retained() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn normal_deletion_and_preview_need_no_git_executable() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree("done");
+    fs::write(tree.join("ignored.txt"), "Disposable ignored content\n").unwrap();
+    fixture.nonlocal_remote();
+    let preview = cli_without_git(&fixture, &["--delete", "--dry-run", "--no-index-refresh"]);
+    assert!(preview.status.success(), "{preview:?}");
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        worktree(only_repository(&preview), &tree)["deletion"]["status"],
+        "would_delete"
+    );
+    assert!(tree.exists());
+
+    let removed = cli_without_git(&fixture, &["--delete", "--no-index-refresh"]);
+    assert!(removed.status.success(), "{removed:?}");
+    let removed: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(
+        worktree(only_repository(&removed), &tree)["deletion"]["status"],
+        "deleted"
+    );
+    assert_eq!(removed["deletion_summary"]["worktrees"], 1);
+    assert!(removed["deletion_summary"]["files"].as_u64().unwrap() > 1);
+    assert!(removed["deletion_summary"]["bytes"].as_u64().unwrap() > 0);
+    assert!(!tree.exists());
+    assert!(fixture.repo.exists());
+    git(&fixture.repo, &["show-ref", "--verify", "refs/heads/done"]);
+}
+
 fn inventory(path: &Path) -> (u64, u64) {
     walkdir::WalkDir::new(path)
         .follow_links(false)
@@ -914,13 +945,18 @@ fn deletion_totals_include_ignored_files_links_and_private_registration() {
     let checkout = inventory(&tree);
     let registration = inventory(&private);
     let expected = (checkout.0 + registration.0, checkout.1 + registration.1);
-    let preview = json(&fixture.scan, &["--delete", "--dry-run"]);
+    // Index refresh may rewrite registration files. Keep this exact-byte
+    // fixture unchanged between its independent inventory and removal.
+    let preview = json(
+        &fixture.scan,
+        &["--delete", "--dry-run", "--no-index-refresh"],
+    );
     assert_eq!(preview["deletion_summary"]["dry_run"], true);
     assert_eq!(preview["deletion_summary"]["worktrees"], 1);
     assert_eq!(preview["deletion_summary"]["files"], expected.0);
     assert_eq!(preview["deletion_summary"]["bytes"], expected.1);
     assert!(tree.exists() && private.exists());
-    let removed = json(&fixture.scan, &["--delete"]);
+    let removed = json(&fixture.scan, &["--delete", "--no-index-refresh"]);
     assert_eq!(removed["deletion_summary"]["dry_run"], false);
     assert_eq!(removed["deletion_summary"]["files"], expected.0);
     assert_eq!(removed["deletion_summary"]["bytes"], expected.1);
