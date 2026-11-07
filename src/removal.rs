@@ -58,6 +58,9 @@ fn validate(common_dir: &Path, worktree: &Path) -> Result<PathBuf> {
     // A trailing separator would make symlink_metadata follow a root symlink.
     let normalized: PathBuf = worktree.components().collect();
     let worktree = normalized.as_path();
+    if worktree.parent().is_none() {
+        bail!("cannot remove a filesystem root");
+    }
     if !worktree.is_absolute() || !fs::symlink_metadata(worktree)?.is_dir() {
         bail!("worktree must be an absolute directory, not a symbolic link");
     }
@@ -69,8 +72,8 @@ fn validate(common_dir: &Path, worktree: &Path) -> Result<PathBuf> {
         bail!("cannot remove the current working directory");
     }
     let common_dir = common_dir.canonicalize()?;
-    if common_dir.starts_with(&worktree) {
-        bail!("worktree contains the shared repository");
+    if common_dir.starts_with(&worktree) || worktree.starts_with(&common_dir) {
+        bail!("worktree overlaps the shared repository");
     }
     let registrations = common_dir
         .join("worktrees")
@@ -181,7 +184,10 @@ fn remove_root(
     for attempt in 0..3 {
         let mut leaves = Vec::new();
         let mut directories = Vec::new();
+        #[cfg(unix)]
         let mut retained: Vec<PathBuf> = Vec::new();
+        #[cfg(not(unix))]
+        let retained: Vec<PathBuf> = Vec::new();
         let mut first_error = None;
         for entry in walk.by_ref() {
             let entry = match entry {
@@ -436,5 +442,27 @@ mod tests {
                 .contains("not a symbolic link")
         );
         assert!(target.join("keep").exists());
+    }
+
+    #[test]
+    fn checkout_cannot_overlap_the_shared_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let common = root.join("common");
+        let checkout = common.join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        assert!(
+            validate(&common, &checkout)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+        assert!(
+            validate(&checkout, &common)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+        assert!(checkout.exists());
     }
 }

@@ -109,7 +109,7 @@ lengths, and can differ from disk space recovered with sparse files, hard links,
 compression, or snapshots. `--no-delete-size` skips file-size collection and
 reports only file and worktree counts (`bytes: null` in JSON). Dry runs show
 estimated totals without deleting files. Measurement and removal do not follow
-symbolic links or cross mounted filesystems.
+symbolic links. On Unix, traversal stays on the containing filesystem.
 
 | Option | Effect |
 | --- | --- |

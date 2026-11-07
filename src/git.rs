@@ -256,7 +256,8 @@ fn seed_from_metadata(path: &Path) -> Option<RepositorySeed> {
 }
 
 pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
-    let result = crate::removal::remove_worktree(repo_path, worktree_path, false);
+    let common_dir = resolve_seed(repo_path)?.common_dir;
+    let result = crate::removal::remove_worktree(&common_dir, worktree_path, false);
     if matches!(result.status, crate::model::DeletionStatus::Deleted) {
         Ok(())
     } else {
